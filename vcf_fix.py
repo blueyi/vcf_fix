@@ -47,12 +47,23 @@ def setup_logging(log_path: Optional[Path] = None, to_file: bool = True) -> logg
 
 
 # ---------- VCF 解析 ----------
+def _strip_qp_soft_break(prev: str) -> str:
+    """去掉上一行末尾的 QP 软换行符（单个 =），合并续行时用。"""
+    s = prev.rstrip("\r\n")
+    if s.endswith("="):
+        return s[:-1]
+    return s
+
+
 def unfold_lines(lines: List[str]) -> List[str]:
-    """VCF 续行：以空格/制表符开头的行与上一行合并。"""
+    """VCF 续行：以空格/制表符开头的行与上一行合并；以 = 开头的行视为 QP 续行也合并。仅对以 = 开头的续行合并时去掉上一行末尾的 QP 软换行符 =。"""
     result = []
     for line in lines:
         if result and (line.startswith(" ") or line.startswith("\t")):
             result[-1] = result[-1].rstrip("\r\n") + line[1:]
+        elif result and line.startswith("=") and ":" not in line.strip():
+            prev = _strip_qp_soft_break(result[-1])
+            result[-1] = prev + line.strip()
         else:
             result.append(line)
     return result
@@ -64,6 +75,15 @@ def decode_quoted_printable(value: str, charset: str = "utf-8") -> str:
         # 将 =XX 形式解码
         decoded = quopri.decodestring(value.encode("latin-1")).decode(charset, errors="replace")
         return decoded
+    except Exception:
+        return value
+
+
+def encode_quoted_printable(value: str, charset: str = "utf-8") -> str:
+    """将字符串编码为 QUOTED-PRINTABLE（与 vCard 原格式一致，不含内部换行由 VCF 折行统一处理）。"""
+    try:
+        encoded = quopri.encodestring(value.encode(charset))
+        return encoded.decode("latin-1").replace("\r", "").replace("\n", "").rstrip()
     except Exception:
         return value
 
@@ -105,23 +125,124 @@ def parse_one_vcard(lines: List[str]) -> Dict:
     return card
 
 
-def parse_vcf(content: str) -> List[Dict]:
-    """解析整个 VCF 内容，返回 VCARD 列表。"""
-    raw_lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    lines = unfold_lines(raw_lines)
-    cards = []
-    current = []
-    for line in lines:
-        if line.strip() == "BEGIN:VCARD":
-            current = []
-        elif line.strip() == "END:VCARD":
-            if current:
-                cards.append(parse_one_vcard(current))
-            current = []
+def _is_continuation_line(line: str) -> bool:
+    """是否为续行（空格/制表符开头，或以 = 开头的 QP 续行）。"""
+    if line.startswith(" ") or line.startswith("\t"):
+        return True
+    if line.startswith("=") and ":" not in line.strip():
+        return True
+    return False
+
+
+def extract_raw_n_fn_adr(block: List[str]) -> Tuple[List[str], List[str], List[List[str]]]:
+    """从原始 vCard 块中提取 N、FN、ADR 的原始行（含折行），原样保留供写入。返回 (_raw_N, _raw_FN, _raw_ADR)。"""
+    raw_n: List[str] = []
+    raw_fn: List[str] = []
+    raw_adr_list: List[List[str]] = []
+    current: Optional[str] = None  # "N", "FN", "ADR"
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current, current_lines
+        if not current:
+            return
+        if current_lines:
+            if current == "N":
+                raw_n.extend(current_lines)
+            elif current == "FN":
+                raw_fn.extend(current_lines)
+            elif current == "ADR":
+                raw_adr_list.append(list(current_lines))
+        current = None
+        current_lines = []
+
+    for line in block:
+        s = line.strip()
+        if s in ("BEGIN:VCARD", "END:VCARD"):
+            flush()
+            continue
+        if not s:
+            continue
+        up = s.upper()
+        if (up.startswith("N;") or up.startswith("N:")) and not up.startswith("NOTE"):
+            flush()
+            current = "N"
+            current_lines = [line.rstrip("\r\n")]
+        elif up.startswith("FN;") or up.startswith("FN:"):
+            flush()
+            current = "FN"
+            current_lines = [line.rstrip("\r\n")]
+        elif up.startswith("ADR;") or up.startswith("ADR:"):
+            flush()
+            current = "ADR"
+            current_lines = [line.rstrip("\r\n")]
+        elif _is_continuation_line(line) and current:
+            current_lines.append(line.rstrip("\r\n"))
         else:
-            current.append(line)
-    if current:
-        cards.append(parse_one_vcard(current))
+            flush()
+    flush()
+    return (raw_n, raw_fn, raw_adr_list)
+
+
+def extract_raw_property_order(block: List[str]) -> List[Tuple[str, List[str]]]:
+    """从原始 vCard 块按出现顺序提取每个属性的完整行（含折行）。返回 [(属性名, [行列表]), ...]。"""
+    result: List[Tuple[str, List[str]]] = []
+    current_key: Optional[str] = None
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_key, current_lines
+        if current_key is not None and current_lines:
+            result.append((current_key, list(current_lines)))
+        current_key = None
+        current_lines = []
+
+    for line in block:
+        s = line.strip()
+        if s in ("BEGIN:VCARD", "END:VCARD") or not s:
+            flush()
+            continue
+        if _is_continuation_line(line) and current_key is not None:
+            current_lines.append(line.rstrip("\r\n"))
+            continue
+        flush()
+        if ":" in s:
+            idx = s.index(":")
+            current_key = s[:idx].strip()
+            current_lines = [line.rstrip("\r\n")]
+    flush()
+    return result
+
+
+def parse_vcf(content: str) -> List[Dict]:
+    """解析整个 VCF 内容，返回 VCARD 列表。同时提取并保存 N、FN、ADR 的原始行供写入时原样输出。"""
+    raw_lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: List[List[str]] = []
+    block: List[str] = []
+    for line in raw_lines:
+        if line.strip() == "BEGIN:VCARD":
+            block = []
+        elif line.strip() == "END:VCARD":
+            if block:
+                blocks.append(block)
+            block = []
+        else:
+            block.append(line)
+    if block:
+        blocks.append(block)
+    cards = []
+    for block in blocks:
+        logical = unfold_lines(block)
+        card = parse_one_vcard(logical)
+        raw_n, raw_fn, raw_adr = extract_raw_n_fn_adr(block)
+        if raw_n:
+            card["_raw_N"] = raw_n
+        if raw_fn:
+            card["_raw_FN"] = raw_fn
+        if raw_adr:
+            card["_raw_ADR"] = raw_adr
+        card["_raw_order"] = extract_raw_property_order(block)
+        cards.append(card)
     return cards
 
 
@@ -220,11 +341,16 @@ def normalize_phone_display(num: str) -> str:
 # ---------- 重复姓名修正 ----------
 def fix_duplicate_name(name: str) -> str:
     """
-    若姓名为重复拼接（如「王三王三」），则改为单次（「王三」）。
-    也处理奇数长度一半重复等情况。
-    少于等于 2 个字的名字不去重（如「朵朵」保留）。
+    修正两类错误姓名：
+    1) AAB/AABC/AABCC 等：前两个字相同且超过 2 字时，删掉第 1 个字，如「鲍鲍永亮」→「鲍永亮」。
+    2) 重复拼接（如「王三王三」）→ 单次（「王三」）；少于等于 2 字保留（如「朵朵」）。
     """
     if not name or len(name) <= 2:
+        return name
+    # 前两字相同且超过 2 字：删掉第 1 个字，循环直到不满足（如 鲍鲍鲍永亮 → 鲍永亮）
+    while len(name) > 2 and name[0] == name[1]:
+        name = name[1:]
+    if len(name) <= 2:
         return name
     n = len(name)
     # 完全两段相同
@@ -240,6 +366,30 @@ def fix_duplicate_name(name: str) -> str:
     return name
 
 
+def get_merge_key(name: str) -> str:
+    """
+    合并用键：若姓名为「姓名+空格+数字/字母」形式（如「鲍旭 b00357649」），
+    取空格前部分作为键，便于与纯姓名「鲍旭」合并为一条并保留「姓名+数字」。
+    """
+    s = name.strip()
+    if not s:
+        return "(无姓名)"
+    if " " in s:
+        suffix = s[s.rfind(" ") + 1 :]
+        if suffix and (suffix.isalnum() or re.match(r"^[a-zA-Z0-9\-_]+$", suffix)):
+            return s[: s.rfind(" ")].strip() or s
+    return s
+
+
+def _is_name_with_id(name: str) -> bool:
+    """是否为「姓名+空格+数字/字母」形式（如「鲍旭 b00357649」）。"""
+    s = name.strip()
+    if " " not in s:
+        return False
+    suffix = s[s.rfind(" ") + 1 :]
+    return bool(suffix) and bool(re.match(r"^[a-zA-Z0-9\-_]+$", suffix))
+
+
 # ---------- 联系人合并（按姓名去重、号码合并）----------
 def merge_contacts(
     cards: List[Dict],
@@ -252,6 +402,7 @@ def merge_contacts(
     name_fix_count = 0
     for card in cards:
         name = get_display_name(card)
+        # 先做姓名修正（如 鲍鲍永亮→鲍永亮、王三王三→王三），仅用于合并键与显示；N/FN 输出保持源文件原样以保证导入兼容
         if fix_name:
             name_fixed = fix_duplicate_name(name)
             if name_fixed != name:
@@ -260,8 +411,9 @@ def merge_contacts(
                 logger.debug(f"  修正重复姓名: {name!r} -> {name_fixed!r}")
                 name = name_fixed
                 set_display_name(card, name)
+                # 不改写 _raw_N/_raw_FN，输出仍用源文件原始行，避免苹果等设备导入失败
 
-        name_key = name.strip() or "(无姓名)"
+        name_key = get_merge_key(name)
         tels = get_tel_list(card)
         if name_key not in by_name:
             by_name[name_key] = copy.deepcopy(card)
@@ -281,20 +433,30 @@ def merge_contacts(
                     by_name[name_key]["_tels"].append((type_k, num))
                     existing_digits.add(num_digits)
                     logger.info(f"[联系人合并] 将号码 {num} 合并到联系人「{name_key}」")
+            # 合并后显示名优先保留「姓名+数字」形式；同时采用该条的原始 N/FN 行（不重新生成，保证与源文件折行一致）
+            existing_name = get_display_name(by_name[name_key])
+            preferred = name if _is_name_with_id(name) else existing_name
+            if preferred != existing_name:
+                logger.info(f"[联系人合并] 显示名采用「姓名+数字」: 「{existing_name}」 -> 「{preferred}」")
+            set_display_name(by_name[name_key], preferred)
+            if preferred == name and _is_name_with_id(name):
+                if "_raw_N" in card:
+                    by_name[name_key]["_raw_N"] = list(card["_raw_N"])
+                if "_raw_FN" in card:
+                    by_name[name_key]["_raw_FN"] = list(card["_raw_FN"])
             continue
 
-    # 写回 TEL 到每个 card，并去掉辅助 key（保留 PHOTO 等其它字段）
+    # 写回 TEL 到每个 card，保留原 TEL 类型（TEL;CELL、TEL;HOME、TEL;VOICE 等）
     result = []
     for name_key, card in by_name.items():
         tels = card.pop("_tels", [])
         to_remove = [k for k in card if k.upper().startswith("TEL")]
         for k in to_remove:
             del card[k]
-        for i, (_, num) in enumerate(tels):
-            key = "TEL;CELL"
-            if key not in card:
-                card[key] = []
-            card[key].append(num)
+        for type_k, num in tels:
+            if type_k not in card:
+                card[type_k] = []
+            card[type_k].append(num)
         result.append(card)
     if merged_count:
         logger.info(f"[联系人合并] 共合并 {merged_count} 条重复联系人")
@@ -323,43 +485,217 @@ def add_country_codes_to_cards(cards: List[Dict], logger: logging.Logger) -> int
     return added_count
 
 
-# ---------- 输出 VCF（保留 PHOTO 等字段，长行按 RFC 折行）----------
+# ---------- 输出 VCF（RFC 2426：75 字符折行；未修改属性原样输出以兼容 iOS 等）----------
+# RFC 2426 section 2.6: lines longer than 75 characters SHOULD be folded (continuation = space + content)
 VCF_LINE_MAX = 75
-VCF_FOLD_CONTINUATION = 74
+VCF_FOLD_CONTINUATION = 74  # 续行 = " " + 最多 74 字符，总长 75
+VCF_CRLF = "\r\n"
 
 
 def fold_vcf_line(line: str) -> List[str]:
-    """VCF 长行折行：首行最多 75 字符，续行以空格开头、每行最多 74 字符内容。"""
+    """
+    按 RFC 2426 折行：首行最多 75 字符，续行以空格开头、每行最多 74 字符。
+    不在 QUOTED-PRINTABLE 的 '=' 处断开，避免续行行末单独 '=' 被解析为 QP 软换行导致兼容性问题。
+    """
     if len(line) <= VCF_LINE_MAX:
         return [line]
-    out = [line[:VCF_LINE_MAX]]
-    i = VCF_LINE_MAX
-    while i < len(line):
-        chunk = line[i : i + VCF_FOLD_CONTINUATION]
-        out.append(" " + chunk)
-        i += VCF_FOLD_CONTINUATION
+    out = []
+    pos = 0
+    first = True
+    while pos < len(line):
+        if first:
+            end = min(pos + VCF_LINE_MAX, len(line))
+            while end > pos and line[end - 1] == "=":
+                end -= 1
+            if end <= pos:
+                end = min(pos + VCF_LINE_MAX, len(line))
+            out.append(line[pos:end])
+            pos = end
+            first = False
+        else:
+            end = min(pos + VCF_FOLD_CONTINUATION, len(line))
+            while end > pos and line[end - 1] == "=":
+                end -= 1
+            if end <= pos:
+                end = min(pos + VCF_FOLD_CONTINUATION, len(line))
+            chunk = line[pos:end]
+            if chunk:
+                out.append(" " + chunk)
+            pos = end
     return out
 
 
+def _looks_like_qp(value: str) -> bool:
+    """判断是否已是 QUOTED-PRINTABLE 形式（=XX 且无可解码的宽字符），避免双编码。"""
+    if not value or "=" not in value:
+        return False
+    # 已是 QP：含 =XX 且不含常见 Unicode 字符（我们解码后会得到中文等）
+    if re.search(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]", value):
+        return False
+    return bool(re.search(r"=[0-9A-Fa-f]{2}", value))
+
+
+def _value_for_output(key: str, value: str) -> str:
+    """若 key 含 ENCODING=QUOTED-PRINTABLE：值已是 QP 则原样，否则按 QP 编码。"""
+    if "ENCODING=QUOTED-PRINTABLE" in key.upper() or "ENCODING=Q" in key.upper():
+        if _looks_like_qp(value):
+            return value
+        charset = "utf-8"
+        if "CHARSET=" in key.upper():
+            m = re.search(r"CHARSET=([^;]+)", key, re.I)
+            if m:
+                charset = m.group(1).strip()
+        return encode_quoted_printable(value, charset)
+    return value
+
+
+def _set_card_raw_n_fn_from_current(card: Dict) -> None:
+    """
+    用卡片当前 N/FN 的值生成折行写入 _raw_N / _raw_FN。
+    当前为兼容苹果等设备导入，主流程不调用此函数，N/FN 一律使用源文件原始行。
+    仅当确实无 _raw_* 时输出逻辑会按 card 内 N/FN 生成（75 字符折行）。
+    """
+    n_key = next((k for k in card if k.upper().startswith("N") and not k.upper().startswith("NOTE")), None)
+    fn_key = next((k for k in card if k.upper().startswith("FN")), None)
+    if n_key and n_key in card and card[n_key]:
+        v = str(card[n_key][0]).strip()
+        if v:
+            line = f"{n_key}:{_value_for_output(n_key, v)}"
+            card["_raw_N"] = fold_vcf_line(line)
+    if fn_key and fn_key in card and card[fn_key]:
+        v = str(card[fn_key][0]).strip()
+        if v:
+            line = f"{fn_key}:{_value_for_output(fn_key, v)}"
+            card["_raw_FN"] = fold_vcf_line(line)
+
+
+def _key_prefix(key: str) -> str:
+    """属性名的前缀（N、FN、TEL、ADR、PHOTO 等），用于判断类型。"""
+    k = key.upper()
+    if k.startswith("NOTE"):
+        return "NOTE"
+    if k.startswith("N"):
+        return "N"
+    if k.startswith("FN"):
+        return "FN"
+    if k.startswith("TEL"):
+        return "TEL"
+    if k.startswith("ADR"):
+        return "ADR"
+    if k.startswith("PHOTO"):
+        return "PHOTO"
+    return key.split(";")[0] if ";" in key else key
+
+
 def card_to_vcard_lines_simple(card: Dict) -> List[str]:
-    """顺序输出所有字段（含 PHOTO 等），长行自动折行以兼容头像等 BASE64 内容。"""
+    """按原始属性顺序输出，符合 RFC 2426：N/FN/ADR 及未修改属性原样输出，仅 TEL 由程序生成并 75 字符折行。"""
     out = ["BEGIN:VCARD", "VERSION:2.1"]
-    for k, vals in card.items():
-        for v in vals:
-            if v and not v.isspace():
-                line = f"{k}:{v}"
-                for folded in fold_vcf_line(line):
-                    out.append(folded)
+    raw_order = card.get("_raw_order")
+    if raw_order:
+        i = 0
+        while i < len(raw_order):
+            key, raw_lines = raw_order[i]
+            prefix = _key_prefix(key)
+            if prefix == "VERSION" or key.upper() == "VERSION":
+                pass  # 已在上方输出
+            elif prefix == "N":
+                if "_raw_N" in card:
+                    out.extend(card["_raw_N"])
+                else:
+                    for k in [x for x in card if x.upper().startswith("N") and not x.upper().startswith("NOTE")]:
+                        for v in card[k]:
+                            if v is not None and str(v).strip():
+                                for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
+                                    out.append(folded)
+            elif prefix == "FN":
+                if "_raw_FN" in card:
+                    out.extend(card["_raw_FN"])
+                else:
+                    for k in [x for x in card if x.upper().startswith("FN")]:
+                        for v in card[k]:
+                            if v is not None and str(v).strip():
+                                for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
+                                    out.append(folded)
+            elif prefix == "ADR":
+                out.extend(raw_lines)
+            elif prefix == "TEL":
+                # 原始文件中 TEL 类型顺序（如先 CELL 后 HOME），据此输出卡片中所有 TEL，每行 RFC 2426 折行
+                tel_key_order: List[str] = []
+                j = i
+                while j < len(raw_order) and _key_prefix(raw_order[j][0]) == "TEL":
+                    k = raw_order[j][0]
+                    if k not in tel_key_order:
+                        tel_key_order.append(k)
+                    j += 1
+                seen_tel_keys = set(tel_key_order)
+                for tel_key in tel_key_order:
+                    for v in card.get(tel_key, []):
+                        if v is not None and str(v).strip():
+                            for folded in fold_vcf_line(f"{tel_key}:{v}"):
+                                out.append(folded)
+                for tel_key in (k for k in card if k.upper().startswith("TEL") and k not in seen_tel_keys):
+                    for v in card[tel_key]:
+                        if v is not None and str(v).strip():
+                            for folded in fold_vcf_line(f"{tel_key}:{v}"):
+                                out.append(folded)
+                i = j - 1
+            else:
+                out.extend(raw_lines)
+            i += 1
+    else:
+        # 无原始顺序（不应出现）：按固定顺序生成，全部 75 字符折行
+        if "_raw_N" in card:
+            out.extend(card["_raw_N"])
+        else:
+            for k in [x for x in card if x.upper().startswith("N") and not x.upper().startswith("NOTE")]:
+                for v in card[k]:
+                    if v is not None and str(v).strip():
+                        for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
+                            out.append(folded)
+        if "_raw_FN" in card:
+            out.extend(card["_raw_FN"])
+        else:
+            for k in [x for x in card if x.upper().startswith("FN")]:
+                for v in card[k]:
+                    if v is not None and str(v).strip():
+                        for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
+                            out.append(folded)
+        if "_raw_ADR" in card:
+            for adr_lines in card["_raw_ADR"]:
+                out.extend(adr_lines)
+        else:
+            for k in [x for x in card if x.upper().startswith("ADR")]:
+                for v in card[k]:
+                    if v is not None and str(v).strip():
+                        for folded in fold_vcf_line(f"{k}:{v}"):
+                            out.append(folded)
+        for k in card:
+            if k.upper().startswith("TEL"):
+                for v in card[k]:
+                    if v is not None and str(v).strip():
+                        for folded in fold_vcf_line(f"{k}:{v}"):
+                            out.append(folded)
+        other = [
+            k for k in card
+            if not k.upper().startswith("TEL") and not k.upper().startswith("N") and not k.upper().startswith("FN")
+            and not k.upper().startswith("ADR") and k not in ("_raw_N", "_raw_FN", "_raw_ADR", "_raw_order")
+            and k.upper() not in ("VERSION", "BEGIN", "END")
+        ]
+        for k in other:
+            for v in card[k]:
+                if v is not None and str(v).strip():
+                    for folded in fold_vcf_line(f"{k}:{v}"):
+                        out.append(folded)
     out.append("END:VCARD")
     return out
 
 
 def write_vcf(cards: List[Dict], path: Path) -> None:
-    """将 VCARD 列表写回 VCF 文件（保留联系人头像等所有字段）。"""
-    with open(path, "w", encoding="utf-8") as f:
+    """将 VCARD 列表写回 VCF 文件（CRLF、与原 vCard 格式一致）。"""
+    with open(path, "w", encoding="utf-8", newline="") as f:
         for card in cards:
             for line in card_to_vcard_lines_simple(card):
-                f.write(line + "\n")
+                f.write(line + VCF_CRLF)
 
 
 # ---------- 查询/展示 ----------
@@ -437,6 +773,7 @@ def main():
     parser.add_argument("--no-log", action="store_true", help="不将变更日志写入文件（仅控制台输出）")
     parser.add_argument("--no-fix-name", action="store_true", help="不自动修正重复姓名")
     parser.add_argument("--no-merge", action="store_true", help="不自动合并同名联系人的号码")
+    parser.add_argument("--no-photo", action="store_true", help="输出时去掉头像（不保留 PHOTO 字段）")
 
     # 仅查询/展示（指定后只执行对应展示并退出，不写回文件）
     parser.add_argument("--list", "--show-all", dest="show_all", action="store_true", help="打印显示所有联系人及号码")
@@ -489,11 +826,11 @@ def main():
 
     # 合并联系人（可选：姓名修正、合并）
     if args.no_merge:
-        # 不合并时仅做同卡内号码去重（保持原列表）
+        # 不合并时仅做同卡内号码去重，保留原 TEL 类型（TEL;CELL、TEL;HOME 等）
         for card in cards:
             tels = get_tel_list(card)
             seen = set()
-            new_tels = []
+            new_tels = []  # (type_k, num)
             for tk, num in tels:
                 d = digits_only(num)
                 if d and d not in seen:
@@ -502,8 +839,8 @@ def main():
             to_remove = [k for k in card if k.upper().startswith("TEL")]
             for k in to_remove:
                 del card[k]
-            for _, num in new_tels:
-                card.setdefault("TEL;CELL", []).append(num)
+            for type_k, num in new_tels:
+                card.setdefault(type_k, []).append(num)
     else:
         cards, merged_contacts_count, name_fix_count = merge_contacts(
             cards, logger, fix_name=not args.no_fix_name
@@ -560,6 +897,14 @@ def main():
     logger.info(f"  仅姓名无号码的联系人: {no_tel_count}")
     if removed_no_tel_count:
         logger.info(f"  已删除无号码联系人（未写入输出）: {removed_no_tel_count}")
+
+    # 若指定不保留头像，则从每条联系人中移除 PHOTO
+    if args.no_photo:
+        for card in cards:
+            for k in list(card):
+                if k.upper().startswith("PHOTO"):
+                    del card[k]
+        logger.info("[去掉头像] 已从输出中移除所有 PHOTO 字段")
 
     out_path = Path(args.output) if args.output else input_path.parent / (input_path.stem + "_fixed.vcf")
     if not out_path.is_absolute():
