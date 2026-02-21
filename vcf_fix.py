@@ -437,7 +437,8 @@ def merge_contacts(
                 logger.debug(f"  修正重复姓名: {name!r} -> {name_fixed!r}")
                 name = name_fixed
                 set_display_name(card, name)
-                # 不改写 _raw_N/_raw_FN，输出仍用源文件原始行，避免苹果等设备导入失败
+                # 用修正后的姓名重写 _raw_N/_raw_FN，折行字符数与原文件一致，便于手机导入
+                _set_card_raw_n_fn_from_current(card)
 
         name_key = get_merge_key(name)
         tels = get_tel_list(card)
@@ -527,32 +528,57 @@ def fold_vcf_line(line: str) -> List[str]:
     按 RFC 2426 折行：首行最多 75 字符，续行以空格开头、每行最多 74 字符。
     不在 QUOTED-PRINTABLE 的 '=' 处断开，避免续行行末单独 '=' 被解析为 QP 软换行导致兼容性问题。
     """
-    if len(line) <= VCF_LINE_MAX:
+    return fold_vcf_line_with_params(line, VCF_LINE_MAX, VCF_FOLD_CONTINUATION)
+
+
+def fold_vcf_line_with_params(
+    line: str, first_max: int = 75, continuation_max: int = 74
+) -> List[str]:
+    """
+    按指定字符数折行：首行最多 first_max 字符，续行以空格开头、每行最多 continuation_max 字符。
+    与原文件折行一致时有利于手机等设备导入。
+    """
+    if len(line) <= first_max:
         return [line]
     out = []
     pos = 0
     first = True
     while pos < len(line):
         if first:
-            end = min(pos + VCF_LINE_MAX, len(line))
+            end = min(pos + first_max, len(line))
             while end > pos and line[end - 1] == "=":
                 end -= 1
             if end <= pos:
-                end = min(pos + VCF_LINE_MAX, len(line))
+                end = min(pos + first_max, len(line))
             out.append(line[pos:end])
             pos = end
             first = False
         else:
-            end = min(pos + VCF_FOLD_CONTINUATION, len(line))
+            end = min(pos + continuation_max, len(line))
             while end > pos and line[end - 1] == "=":
                 end -= 1
             if end <= pos:
-                end = min(pos + VCF_FOLD_CONTINUATION, len(line))
+                end = min(pos + continuation_max, len(line))
             chunk = line[pos:end]
             if chunk:
                 out.append(" " + chunk)
             pos = end
     return out
+
+
+def _infer_fold_params_from_raw_lines(raw_lines: List[str]) -> Tuple[int, int]:
+    """
+    从原始 N/FN 折行推断首行最大长度与续行内容最大长度（续行含前导空格时总长为 1+continuation_max）。
+    若只有一行或无法推断，返回默认 75、74。
+    """
+    if not raw_lines:
+        return VCF_LINE_MAX, VCF_FOLD_CONTINUATION
+    first_len = len(raw_lines[0].rstrip("\r\n"))
+    if len(raw_lines) == 1:
+        return first_len if first_len >= VCF_LINE_MAX else VCF_LINE_MAX, VCF_FOLD_CONTINUATION
+    cont_lens = [len(ln.rstrip("\r\n")) - 1 for ln in raw_lines[1:] if ln.startswith(" ") or ln.startswith("\t")]
+    cont_max = max(cont_lens, default=VCF_FOLD_CONTINUATION)
+    return first_len, cont_max
 
 
 def _looks_like_qp(value: str) -> bool:
@@ -579,24 +605,38 @@ def _value_for_output(key: str, value: str) -> str:
     return value
 
 
+def _strip_encoding_from_key(key: str) -> str:
+    """
+    从属性名中移除 ENCODING=QUOTED-PRINTABLE / ENCODING=Q，避免生成的 N/FN 使用 QP 编码。
+    QP 编码值中的字面量 '-' 可能被部分手机误解析，改为仅用 CHARSET 输出 UTF-8 更稳妥。
+    """
+    k = key
+    for pat in (r";ENCODING=QUOTED-PRINTABLE", r";ENCODING=Q\b"):
+        k = re.sub(pat, "", k, flags=re.I)
+    return k
+
+
 def _set_card_raw_n_fn_from_current(card: Dict) -> None:
     """
     用卡片当前 N/FN 的值生成折行写入 _raw_N / _raw_FN。
-    当前为兼容苹果等设备导入，主流程不调用此函数，N/FN 一律使用源文件原始行。
-    仅当确实无 _raw_* 时输出逻辑会按 card 内 N/FN 生成（75 字符折行）。
+    折行字符数与原文件一致；且去掉 ENCODING 参数、直接输出 UTF-8，避免 QP 值中的 '-' 导致手机导入失败。
     """
     n_key = next((k for k in card if k.upper().startswith("N") and not k.upper().startswith("NOTE")), None)
     fn_key = next((k for k in card if k.upper().startswith("FN")), None)
     if n_key and n_key in card and card[n_key]:
         v = str(card[n_key][0]).strip()
         if v:
-            line = f"{n_key}:{_value_for_output(n_key, v)}"
-            card["_raw_N"] = fold_vcf_line(line)
+            out_key = _strip_encoding_from_key(n_key)
+            line = f"{out_key}:{_value_for_output(out_key, v)}"
+            first_max, cont_max = _infer_fold_params_from_raw_lines(card.get("_raw_N", []))
+            card["_raw_N"] = fold_vcf_line_with_params(line, first_max, cont_max)
     if fn_key and fn_key in card and card[fn_key]:
         v = str(card[fn_key][0]).strip()
         if v:
-            line = f"{fn_key}:{_value_for_output(fn_key, v)}"
-            card["_raw_FN"] = fold_vcf_line(line)
+            out_key = _strip_encoding_from_key(fn_key)
+            line = f"{out_key}:{_value_for_output(out_key, v)}"
+            first_max, cont_max = _infer_fold_params_from_raw_lines(card.get("_raw_FN", []))
+            card["_raw_FN"] = fold_vcf_line_with_params(line, first_max, cont_max)
 
 
 def _key_prefix(key: str) -> str:
