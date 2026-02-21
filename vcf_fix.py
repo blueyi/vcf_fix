@@ -98,8 +98,22 @@ def parse_vcf_value(line: str) -> Tuple[str, str]:
     return name, value
 
 
+def _strip_param_from_value(value: str) -> str:
+    """
+    若值被错误解析进参数片段（如 ENCODING=QUOTED-PRINTABLE:真实值），
+    则只保留冒号后的真实值，避免显示「ENCODING=XXX」等。
+    """
+    if not value or ":" not in value:
+        return value
+    s = value.strip()
+    if re.match(r"^(ENCODING|CHARSET)=[^:]*:", s, re.I):
+        return s.split(":", 1)[-1].strip()
+    return value
+
+
 def decode_field_value(name: str, value: str) -> str:
     """若为 QUOTED-PRINTABLE 则解码。"""
+    value = _strip_param_from_value(value)
     if "ENCODING=QUOTED-PRINTABLE" in name.upper() or "ENCODING=Q" in name.upper():
         charset = "utf-8"
         if "CHARSET=" in name.upper():
@@ -123,6 +137,17 @@ def parse_one_vcard(lines: List[str]) -> Dict:
             card[name] = []
         card[name].append(value)
     return card
+
+
+def _fix_raw_n_fn_malformed_line(line: str) -> str:
+    """
+    修正首行中误把参数当值的情况（如 FN;CHARSET=UTF-8:ENCODING=QUOTED-PRINTABLE:值 → 参数归位），
+    避免设备显示「ENCODING=XXX」。
+    """
+    if ":ENCODING=" in line.upper() or ":CHARSET=" in line.upper():
+        line = re.sub(r":ENCODING=", ";ENCODING=", line, flags=re.I)
+        line = re.sub(r":CHARSET=", ";CHARSET=", line, flags=re.I)
+    return line
 
 
 def _is_continuation_line(line: str) -> bool:
@@ -167,11 +192,11 @@ def extract_raw_n_fn_adr(block: List[str]) -> Tuple[List[str], List[str], List[L
         if (up.startswith("N;") or up.startswith("N:")) and not up.startswith("NOTE"):
             flush()
             current = "N"
-            current_lines = [line.rstrip("\r\n")]
+            current_lines = [_fix_raw_n_fn_malformed_line(line.rstrip("\r\n"))]
         elif up.startswith("FN;") or up.startswith("FN:"):
             flush()
             current = "FN"
-            current_lines = [line.rstrip("\r\n")]
+            current_lines = [_fix_raw_n_fn_malformed_line(line.rstrip("\r\n"))]
         elif up.startswith("ADR;") or up.startswith("ADR:"):
             flush()
             current = "ADR"
@@ -341,19 +366,20 @@ def normalize_phone_display(num: str) -> str:
 # ---------- 重复姓名修正 ----------
 def fix_duplicate_name(name: str) -> str:
     """
-    修正两类错误姓名：
-    1) AAB/AABC/AABCC 等：前两个字相同且超过 2 字时，删掉第 1 个字，如「鲍鲍永亮」→「鲍永亮」。
-    2) 重复拼接（如「王三王三」）→ 单次（「王三」）；少于等于 2 字保留（如「朵朵」）。
+    修正三类错误姓名：
+    1) AAB/AABC 等：前两字相同且超过 2 字时删第 1 字，如「白白艳强」→「白艳强」。
+    2) 整段重复：如「王三王三」→「王三」、「成龙 c00858566成龙 c00858566」→「成龙 c00858566」。
+    3) 少于等于 2 字保留（如「朵朵」）。
     """
     if not name or len(name) <= 2:
         return name
-    # 前两字相同且超过 2 字：删掉第 1 个字，循环直到不满足（如 鲍鲍鲍永亮 → 鲍永亮）
+    # 前两字相同且超过 2 字：删掉第 1 个字，循环直到不满足（如 白白艳强 → 白艳强）
     while len(name) > 2 and name[0] == name[1]:
         name = name[1:]
     if len(name) <= 2:
         return name
     n = len(name)
-    # 完全两段相同
+    # 完全两段相同（含「姓名+数字」重复，如 成龙 c00858566成龙 c00858566 → 成龙 c00858566）
     if n % 2 == 0 and name[: n // 2] == name[n // 2 :]:
         return name[: n // 2]
     # 尝试较短周期
@@ -433,13 +459,17 @@ def merge_contacts(
                     by_name[name_key]["_tels"].append((type_k, num))
                     existing_digits.add(num_digits)
                     logger.info(f"[联系人合并] 将号码 {num} 合并到联系人「{name_key}」")
-            # 合并后显示名优先保留「姓名+数字」形式；同时采用该条的原始 N/FN 行（不重新生成，保证与源文件折行一致）
+            # 合并后显示名优先保留「姓名+数字」或更规范的一条（如 白艳强 优先于 白白艳强）；采用该条的原始 N/FN 行
             existing_name = get_display_name(by_name[name_key])
             preferred = name if _is_name_with_id(name) else existing_name
+            if not _is_name_with_id(name) and not _is_name_with_id(existing_name):
+                # 两条均为纯姓名时，优先保留「修正后」更短/规范的一条（如 白艳强 而非 白白艳强）
+                if fix_duplicate_name(existing_name) != existing_name and fix_duplicate_name(name) == name:
+                    preferred = name
             if preferred != existing_name:
-                logger.info(f"[联系人合并] 显示名采用「姓名+数字」: 「{existing_name}」 -> 「{preferred}」")
+                logger.info(f"[联系人合并] 显示名采用: 「{existing_name}」 -> 「{preferred}」")
             set_display_name(by_name[name_key], preferred)
-            if preferred == name and _is_name_with_id(name):
+            if preferred == name:
                 if "_raw_N" in card:
                     by_name[name_key]["_raw_N"] = list(card["_raw_N"])
                 if "_raw_FN" in card:
