@@ -114,7 +114,7 @@ def _strip_param_from_value(value: str) -> str:
 def _clean_decoded_name(s: str) -> str:
     """
     从解码后的姓名字段中移除误混入的 ENCODING/CHARSET/QUOTED-PRINTABLE 等参数片段，
-    保留如「池哲贵-NVIDIA-上海」「王勇-北京-自动化」等正常姓名。
+    保留如「张三-公司-上海」「王小二-北京-部门」等正常姓名。
     """
     if not s or not isinstance(s, str):
         return s
@@ -122,6 +122,20 @@ def _clean_decoded_name(s: str) -> str:
     s = re.sub(r"(ENCODING|CHARSET)=[^;\s]+", "", s, flags=re.I)
     s = re.sub(r"QUOTED-PRINTABLE", "", s, flags=re.I)
     s = s.rstrip(";").strip()
+    return s
+
+
+def _normalize_name_order(name: str) -> str:
+    """
+    「名 姓」格式（如「三 张」「小二 王」）转为「姓+名」（张三、王小二）。
+    仅当恰好两段且第二段为单字时视为单字姓，互换为 姓+名。
+    """
+    s = (name or "").strip()
+    if not s:
+        return s
+    parts = re.split(r"\s+", s, maxsplit=1)
+    if len(parts) == 2 and len(parts[1]) == 1:
+        return parts[1] + parts[0]
     return s
 
 
@@ -286,17 +300,19 @@ def parse_vcf(content: str) -> List[Dict]:
 
 
 def get_display_name(card: Dict) -> str:
-    """从 VCARD 获取显示名：优先 FN，否则用 N 拼。对解码结果做 _clean_decoded_name，避免混入 ENCODING/CHARSET 等残片。"""
+    """从 VCARD 获取显示名：优先 FN，否则用 N 拼。清理残片后做「名 姓」→「姓+名」规范化。"""
     fn_key = next((k for k in card if k.upper().startswith("FN")), None)
     if fn_key and card[fn_key]:
         raw = decode_field_value(fn_key, card[fn_key][0])
-        return _clean_decoded_name(raw)
+        name = _clean_decoded_name(raw)
+        return _normalize_name_order(name)
     n_key = next((k for k in card if k.upper().startswith("N")), None)
     if n_key and card[n_key]:
         n_val = decode_field_value(n_key, card[n_key][0])
         n_val = _clean_decoded_name(n_val)
         parts = [p.strip() for p in n_val.split(";")]
-        return "".join(p for p in parts if p)
+        name = "".join(p for p in parts if p)
+        return _normalize_name_order(name)
     return ""
 
 
@@ -383,19 +399,19 @@ def normalize_phone_display(num: str) -> str:
 def fix_duplicate_name(name: str) -> str:
     """
     修正三类错误姓名：
-    1) AAB/AABC 等：前两字相同且超过 2 字时删第 1 字，如「白白艳强」→「白艳强」。
-    2) 整段重复：如「王三王三」→「王三」、「成龙 c00858566成龙 c00858566」→「成龙 c00858566」。
-    3) 少于等于 2 字保留（如「朵朵」）。
+    1) AAB/AABC 等：前两字相同且超过 2 字时删第 1 字，如「张三张三」→「张三」。
+    2) 整段重复：如「王三王三」→「王三」、「王小二 a001王小二 a001」→「王小二 a001」。
+    3) 少于等于 2 字保留（如「张三」）。
     """
     if not name or len(name) <= 2:
         return name
-    # 前两字相同且超过 2 字：删掉第 1 个字，循环直到不满足（如 白白艳强 → 白艳强）
+    # 前两字相同且超过 2 字：删掉第 1 个字，循环直到不满足（如 张三张三 → 张三）
     while len(name) > 2 and name[0] == name[1]:
         name = name[1:]
     if len(name) <= 2:
         return name
     n = len(name)
-    # 完全两段相同（含「姓名+数字」重复，如 成龙 c00858566成龙 c00858566 → 成龙 c00858566）
+    # 完全两段相同（含「姓名+数字」重复，如 王小二 a001王小二 a001 → 王小二 a001）
     if n % 2 == 0 and name[: n // 2] == name[n // 2 :]:
         return name[: n // 2]
     # 尝试较短周期
@@ -410,8 +426,8 @@ def fix_duplicate_name(name: str) -> str:
 
 def get_merge_key(name: str) -> str:
     """
-    合并用键：若姓名为「姓名+空格+数字/字母」形式（如「鲍旭 b00357649」），
-    取空格前部分作为键，便于与纯姓名「鲍旭」合并为一条并保留「姓名+数字」。
+    合并用键：若姓名为「姓名+空格+数字/字母」形式（如「张三 b00357649」），
+    取空格前部分作为键，便于与纯姓名「张三」合并为一条并保留「姓名+数字」。
     """
     s = name.strip()
     if not s:
@@ -424,7 +440,7 @@ def get_merge_key(name: str) -> str:
 
 
 def _is_name_with_id(name: str) -> bool:
-    """是否为「姓名+空格+数字/字母」形式（如「鲍旭 b00357649」）。"""
+    """是否为「姓名+空格+数字/字母」形式（如「张三 b00357649」）。"""
     s = name.strip()
     if " " not in s:
         return False
@@ -444,7 +460,7 @@ def merge_contacts(
     name_fix_count = 0
     for card in cards:
         name = get_display_name(card)
-        # 先做姓名修正（如 鲍鲍永亮→鲍永亮、王三王三→王三），仅用于合并键与显示；N/FN 输出保持源文件原样以保证导入兼容
+        # 先做姓名修正（如 张三张三→张三、王三王三→王三），仅用于合并键与显示
         if fix_name:
             name_fixed = fix_duplicate_name(name)
             if name_fixed != name:
@@ -476,11 +492,11 @@ def merge_contacts(
                     by_name[name_key]["_tels"].append((type_k, num))
                     existing_digits.add(num_digits)
                     logger.info(f"[联系人合并] 将号码 {num} 合并到联系人「{name_key}」")
-            # 合并后显示名优先保留「姓名+数字」或更规范的一条（如 白艳强 优先于 白白艳强）；采用该条的原始 N/FN 行
+            # 合并后显示名优先保留「姓名+数字」或更规范的一条（如 张三 优先于 张三张三）
             existing_name = get_display_name(by_name[name_key])
             preferred = name if _is_name_with_id(name) else existing_name
             if not _is_name_with_id(name) and not _is_name_with_id(existing_name):
-                # 两条均为纯姓名时，优先保留「修正后」更短/规范的一条（如 白艳强 而非 白白艳强）
+                # 两条均为纯姓名时，优先保留「修正后」更短/规范的一条（如 张三 而非 张三张三）
                 if fix_duplicate_name(existing_name) != existing_name and fix_duplicate_name(name) == name:
                     preferred = name
             if preferred != existing_name:
