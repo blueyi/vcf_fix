@@ -111,6 +111,20 @@ def _strip_param_from_value(value: str) -> str:
     return value
 
 
+def _clean_decoded_name(s: str) -> str:
+    """
+    从解码后的姓名字段中移除误混入的 ENCODING/CHARSET/QUOTED-PRINTABLE 等参数片段，
+    保留如「池哲贵-NVIDIA-上海」「王勇-北京-自动化」等正常姓名。
+    """
+    if not s or not isinstance(s, str):
+        return s
+    s = s.strip()
+    s = re.sub(r"(ENCODING|CHARSET)=[^;\s]+", "", s, flags=re.I)
+    s = re.sub(r"QUOTED-PRINTABLE", "", s, flags=re.I)
+    s = s.rstrip(";").strip()
+    return s
+
+
 def decode_field_value(name: str, value: str) -> str:
     """若为 QUOTED-PRINTABLE 则解码。"""
     value = _strip_param_from_value(value)
@@ -272,13 +286,15 @@ def parse_vcf(content: str) -> List[Dict]:
 
 
 def get_display_name(card: Dict) -> str:
-    """从 VCARD 获取显示名：优先 FN，否则用 N 拼。"""
+    """从 VCARD 获取显示名：优先 FN，否则用 N 拼。对解码结果做 _clean_decoded_name，避免混入 ENCODING/CHARSET 等残片。"""
     fn_key = next((k for k in card if k.upper().startswith("FN")), None)
     if fn_key and card[fn_key]:
-        return decode_field_value(fn_key, card[fn_key][0])
+        raw = decode_field_value(fn_key, card[fn_key][0])
+        return _clean_decoded_name(raw)
     n_key = next((k for k in card if k.upper().startswith("N")), None)
     if n_key and card[n_key]:
         n_val = decode_field_value(n_key, card[n_key][0])
+        n_val = _clean_decoded_name(n_val)
         parts = [p.strip() for p in n_val.split(";")]
         return "".join(p for p in parts if p)
     return ""
@@ -639,6 +655,22 @@ def _set_card_raw_n_fn_from_current(card: Dict) -> None:
             card["_raw_FN"] = fold_vcf_line_with_params(line, first_max, cont_max)
 
 
+def _canonical_n_fn_lines(card: Dict) -> Tuple[List[str], List[str]]:
+    """
+    生成规范形式的 N/FN 行：N;CHARSET=UTF-8:;姓名;;; 与 FN;CHARSET=UTF-8:姓名，
+    无 ENCODING=QUOTED-PRINTABLE，值为 UTF-8。折行长度与原 _raw_N/_raw_FN 一致。
+    """
+    name = get_display_name(card)
+    first_n, cont_n = _infer_fold_params_from_raw_lines(card.get("_raw_N", []))
+    first_fn, cont_fn = _infer_fold_params_from_raw_lines(card.get("_raw_FN", []))
+    n_line = f"N;CHARSET=UTF-8:;{name};;;"
+    fn_line = f"FN;CHARSET=UTF-8:{name}"
+    return (
+        fold_vcf_line_with_params(n_line, first_n, cont_n),
+        fold_vcf_line_with_params(fn_line, first_fn, cont_fn),
+    )
+
+
 def _key_prefix(key: str) -> str:
     """属性名的前缀（N、FN、TEL、ADR、PHOTO 等），用于判断类型。"""
     k = key.upper()
@@ -669,23 +701,11 @@ def card_to_vcard_lines_simple(card: Dict) -> List[str]:
             if prefix == "VERSION" or key.upper() == "VERSION":
                 pass  # 已在上方输出
             elif prefix == "N":
-                if "_raw_N" in card:
-                    out.extend(card["_raw_N"])
-                else:
-                    for k in [x for x in card if x.upper().startswith("N") and not x.upper().startswith("NOTE")]:
-                        for v in card[k]:
-                            if v is not None and str(v).strip():
-                                for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
-                                    out.append(folded)
+                n_lines, _ = _canonical_n_fn_lines(card)
+                out.extend(n_lines)
             elif prefix == "FN":
-                if "_raw_FN" in card:
-                    out.extend(card["_raw_FN"])
-                else:
-                    for k in [x for x in card if x.upper().startswith("FN")]:
-                        for v in card[k]:
-                            if v is not None and str(v).strip():
-                                for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
-                                    out.append(folded)
+                _, fn_lines = _canonical_n_fn_lines(card)
+                out.extend(fn_lines)
             elif prefix == "ADR":
                 out.extend(raw_lines)
             elif prefix == "TEL":
@@ -714,22 +734,9 @@ def card_to_vcard_lines_simple(card: Dict) -> List[str]:
             i += 1
     else:
         # 无原始顺序（不应出现）：按固定顺序生成，全部 75 字符折行
-        if "_raw_N" in card:
-            out.extend(card["_raw_N"])
-        else:
-            for k in [x for x in card if x.upper().startswith("N") and not x.upper().startswith("NOTE")]:
-                for v in card[k]:
-                    if v is not None and str(v).strip():
-                        for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
-                            out.append(folded)
-        if "_raw_FN" in card:
-            out.extend(card["_raw_FN"])
-        else:
-            for k in [x for x in card if x.upper().startswith("FN")]:
-                for v in card[k]:
-                    if v is not None and str(v).strip():
-                        for folded in fold_vcf_line(f"{k}:{_value_for_output(k, str(v))}"):
-                            out.append(folded)
+        n_lines, fn_lines = _canonical_n_fn_lines(card)
+        out.extend(n_lines)
+        out.extend(fn_lines)
         if "_raw_ADR" in card:
             for adr_lines in card["_raw_ADR"]:
                 out.extend(adr_lines)
