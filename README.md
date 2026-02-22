@@ -47,7 +47,7 @@ python3 vcf_fix.py --no-merge           # 不合并同名联系人
 # 仅查询/展示（不写回文件）
 python3 vcf_fix.py --list               # 打印显示所有联系人及号码
 python3 vcf_fix.py --name "张三"        # 显示该姓名下的全部号码
-python3 vcf_fix.py --number "13800138000"  # 显示包含该号码的全部联系人
+python3 vcf_fix.py --number "12345678901"  # 大陆示例号；香港示例号可用 12345678
 
 # 无号码联系人：修复结束后会列出「仅姓名无号码」的联系人；加下方选项则从输出文件中删除他们
 python3 vcf_fix.py --remove-no-tel        # 删除无号码联系人（不写入输出 VCF）

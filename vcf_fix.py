@@ -317,7 +317,7 @@ def get_display_name(card: Dict) -> str:
 
 
 def get_tel_list(card: Dict) -> List[Tuple[str, str]]:
-    """获取 (type_key, number) 列表，如 ('TEL;CELL', '13800138000')。"""
+    """获取 (type_key, number) 列表，如 ('TEL;CELL', '12345678901')。"""
     result = []
     for key in card:
         if key.upper().startswith("TEL"):
@@ -353,6 +353,50 @@ def set_display_name(card: Dict, new_name: str) -> None:
 # ---------- 电话号码规范化与区号 ----------
 def digits_only(s: str) -> str:
     return re.sub(r"\D", "", s)
+
+
+def _tel_core_digits(num: str) -> str:
+    """
+    去掉区号后的本地号码（纯数字），用于判断是否为同一号码。
+    例如 +8612345678901、+86 12345678901 均得到 12345678901。
+    """
+    raw = digits_only(num)
+    if not raw:
+        return raw
+    if raw.startswith("86") and len(raw) in (11 + 2, 12 + 2, 13):
+        return raw[2:]
+    if raw.startswith("852") and len(raw) == 8 + 3:
+        return raw[3:]
+    if raw.startswith("853") and len(raw) == 8 + 3:
+        return raw[3:]
+    return raw
+
+
+def dedup_phones_per_contact(card: Dict) -> None:
+    """
+    对单个联系人的号码按「区号后一致」去重：同一本地号码只保留一条，
+    保留为本地形式（如 12345678901），后续加区号会生成 +86 12345678901。
+    不修改联系人姓名等其他信息。
+    """
+    tels = get_tel_list(card)
+    if not tels:
+        return
+    seen_cores: Set[str] = set()
+    new_tels: List[Tuple[str, str]] = []
+    type_key = tels[0][0]  # 保留第一个 TEL 类型，如 TEL;CELL
+    for _, num in tels:
+        core = _tel_core_digits(num)
+        if not core or core in seen_cores:
+            continue
+        seen_cores.add(core)
+        new_tels.append((type_key, core))
+    if len(new_tels) == len(tels):
+        return
+    to_remove = [k for k in card if k.upper().startswith("TEL")]
+    for k in to_remove:
+        del card[k]
+    for type_k, num in new_tels:
+        card.setdefault(type_k, []).append(num)
 
 
 def infer_region_and_add_prefix(num: str) -> Tuple[str, Optional[str]]:
@@ -400,7 +444,7 @@ def fix_duplicate_name(name: str) -> str:
     """
     修正三类错误姓名：
     1) AAB/AABC 等：前两字相同且超过 2 字时删第 1 字，如「张三张三」→「张三」。
-    2) 整段重复：如「王三王三」→「王三」、「王小二 a001王小二 a001」→「王小二 a001」。
+    2) 整段重复：如「王三王三」→「王三」、「张三 a001张三 a001」→「张三 a001」。
     3) 少于等于 2 字保留（如「张三」）。
     """
     if not name or len(name) <= 2:
@@ -411,7 +455,7 @@ def fix_duplicate_name(name: str) -> str:
     if len(name) <= 2:
         return name
     n = len(name)
-    # 完全两段相同（含「姓名+数字」重复，如 王小二 a001王小二 a001 → 王小二 a001）
+    # 完全两段相同（含「姓名+数字」重复，如 张三 a001张三 a001 → 张三 a001）
     if n % 2 == 0 and name[: n // 2] == name[n // 2 :]:
         return name[: n // 2]
     # 尝试较短周期
@@ -426,7 +470,7 @@ def fix_duplicate_name(name: str) -> str:
 
 def get_merge_key(name: str) -> str:
     """
-    合并用键：若姓名为「姓名+空格+数字/字母」形式（如「张三 b00357649」），
+    合并用键：若姓名为「姓名+空格+数字/字母」形式（如「张三 a001」），
     取空格前部分作为键，便于与纯姓名「张三」合并为一条并保留「姓名+数字」。
     """
     s = name.strip()
@@ -440,7 +484,7 @@ def get_merge_key(name: str) -> str:
 
 
 def _is_name_with_id(name: str) -> bool:
-    """是否为「姓名+空格+数字/字母」形式（如「张三 b00357649」）。"""
+    """是否为「姓名+空格+数字/字母」形式（如「张三 a001」）。"""
     s = name.strip()
     if " " not in s:
         return False
@@ -546,6 +590,12 @@ def add_country_codes_to_cards(cards: List[Dict], logger: logging.Logger) -> int
                     logger.debug(f"  原号码: {num!r} -> 新增: {normalized!r}")
             card[key] = new_vals
     return added_count
+
+
+def dedup_phones_in_cards(cards: List[Dict]) -> None:
+    """对每个联系人按「区号后一致」合并重复号码，仅修改 TEL，不改姓名等。"""
+    for card in cards:
+        dedup_phones_per_contact(card)
 
 
 # ---------- 输出 VCF（RFC 2426：75 字符折行；未修改属性原样输出以兼容 iOS 等）----------
@@ -858,7 +908,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="VCF 联系人解析与修正。不指定功能选项时，默认自动修复并写入日志。"
     )
-    parser.add_argument("input", nargs="?", default="Contacts_20260119.vcf", help="输入 VCF 文件")
+    parser.add_argument("input", nargs="?", default="contacts.vcf", help="输入 VCF 文件")
     parser.add_argument("-o", "--output", default=None, help="输出 VCF 文件（默认在输入文件名后加 _fixed）")
 
     # 功能开关（默认开启；加对应 --no-* 则关闭）
@@ -938,6 +988,9 @@ def main():
         cards, merged_contacts_count, name_fix_count = merge_contacts(
             cards, logger, fix_name=not args.no_fix_name
         )
+
+    # 按「区号后一致」合并重复号码（每个联系人仅保留唯一本地号，后续加区号会生成 +86 与本地两种形式）
+    dedup_phones_in_cards(cards)
 
     # 添加国际区号（可选）
     if not args.no_country_code:
